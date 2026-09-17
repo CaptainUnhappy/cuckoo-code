@@ -1,24 +1,23 @@
 /**
- * Claude Provider 定义
- * 基于 claude.ai 页面结构，输入框为 ProseMirror（contenteditable）。
+ * ChatGPT Provider 定义
+ * 基于 chatgpt.com 页面结构，输入框为 ProseMirror（contenteditable）。
  */
 // ========== 网络拦截器（内联，注入主世界执行）==========
 // 说明：hook 源码直接内联在 provider 中，保证 provider 单文件自包含。
 // 函数体必须自包含（不引用模块级变量）。
-function claudeHookInstaller() {
-  var MARKER = '__cuckooClaudeHookInstalled__';
+function chatgptHookInstaller() {
+  var MARKER = '__cuckooChatgptHookInstalled__';
   if (window[MARKER]) return;
   window[MARKER] = true;
 
-  // claude.ai 的 completion 端点形如：
-  // /api/organizations/{org}/chat_conversations/{conv}/completion
   function isCompletion(url, method) {
     if (!url) return false;
     if (String(method || 'GET').toUpperCase() !== 'POST') return false;
     try {
       var u = new URL(url, document.baseURI);
-      if (u.hostname.indexOf('claude.ai') === -1) return false;
-      return /\/chat_conversations\/[^/]+\/(completion|retry_completion)$/.test(u.pathname);
+      var host = u.hostname;
+      if (host.indexOf('chatgpt.com') === -1 && host.indexOf('chat.openai.com') === -1) return false;
+      return /\/backend-api\/(?:f\/)?conversation\/?$/.test(u.pathname);
     } catch (e) {
       return false;
     }
@@ -57,8 +56,9 @@ function claudeHookInstaller() {
     };
   }
 
+  // 返回 { data: string|null, done: boolean }
   function parseBlock(block) {
-    if (!block || !block.trim()) return null;
+    if (!block || !block.trim()) return { data: null, done: false };
     var data = null;
     var lines = block.split(/\r\n|\r|\n/);
     for (var i = 0; i < lines.length; i++) {
@@ -68,36 +68,72 @@ function claudeHookInstaller() {
         data = data == null ? d : data + '\n' + d;
       }
     }
-    if (data == null) return null;
-    try { return JSON.parse(data); } catch (e) { return null; }
+    if (data == null) return { data: null, done: false };
+    if (data === '[DONE]') return { data: null, done: true };
+    return { data: data, done: false };
   }
 
-  // ---------- 回复文本提取（Anthropic 流式事件格式）----------
-  // 关注：
-  //   content_block_delta + delta.type==='text_delta' → delta.text
-  //   message_stop                                    → finished
-  // 忽略 thinking_delta（思考内容）
+  // ---------- 回复文本提取 ----------
   function createExtractor() {
     var text = '';
     var finished = false;
 
-    function consume(parsed) {
-      if (!parsed || typeof parsed !== 'object') return;
-      var type = parsed.type;
-      if (type === 'content_block_delta' && parsed.delta) {
-        var d = parsed.delta;
-        if (d.type === 'text_delta' && typeof d.text === 'string') {
-          text += d.text;
-        }
-        // thinking_delta / signature_delta 忽略
+    function extractParts(content) {
+      if (!content || !Array.isArray(content.parts)) return null;
+      var out = '';
+      for (var i = 0; i < content.parts.length; i++) {
+        var p = content.parts[i];
+        if (typeof p === 'string') out += p;
+        else if (p && typeof p === 'object' && typeof p.text === 'string') out += p.text;
+      }
+      return out;
+    }
+
+    function applyOp(node) {
+      if (!node || typeof node !== 'object') return;
+
+      // 1) 批量操作：o='patch' / 'BATCH'，v 为操作数组
+      if (Array.isArray(node.v) && (node.o === 'patch' || node.o === 'BATCH')) {
+        for (var i = 0; i < node.v.length; i++) applyOp(node.v[i]);
         return;
       }
-      if (type === 'message_stop') { finished = true; return; }
-      if (type === 'error') { finished = true; return; }
+
+      // 2) 消息快照：v.message（仅采纳 assistant）
+      if (node.v && typeof node.v === 'object' && node.v.message) {
+        var m = node.v.message;
+        var role = m.author && m.author.role;
+        if (role === 'assistant') {
+          var snap = extractParts(m.content);
+          if (snap !== null) text = snap;
+        }
+        return;
+      }
+
+      // 3) 路径操作
+      if (typeof node.p === 'string' && node.p !== '') {
+        if (node.p === '/message/status' && node.v === 'finished_successfully') { finished = true; return; }
+        if (node.p === '/message/end_turn' && node.v === true) { finished = true; return; }
+        if (/\/message\/content\/parts\/\d+$/.test(node.p)) {
+          if (typeof node.v === 'string') {
+            if (node.o === 'append' || node.o === 'add') text += node.v;
+            else text = node.v;
+          }
+        }
+        return;
+      }
+
+      // 4) 裸 v 字符串（无有效 p）：追加正文
+      if (typeof node.v === 'string') { text += node.v; return; }
+
+      // 5) 类型化结束事件
+      if (node.type === 'message_stream_complete' || node.type === 'message_stream_completed') {
+        finished = true;
+      }
     }
 
     return {
-      consume: consume,
+      consume: function (parsed) { applyOp(parsed); },
+      markDone: function () { finished = true; },
       get text() { return text; },
       get finished() { return finished; }
     };
@@ -111,12 +147,18 @@ function claudeHookInstaller() {
     var extractor = createExtractor();
     var dispatched = false;
 
+    function flushFrame(frame) {
+      var r = parseBlock(frame);
+      if (r.done) { extractor.markDone(); return; }
+      if (r.data == null) return;
+      var parsed;
+      try { parsed = JSON.parse(r.data); } catch (e) { return; }
+      extractor.consume(parsed);
+    }
+
     function feed(chunk) {
       var frames = frameDecoder.push(chunk);
-      for (var i = 0; i < frames.length; i++) {
-        var parsed = parseBlock(frames[i]);
-        if (parsed) extractor.consume(parsed);
-      }
+      for (var i = 0; i < frames.length; i++) flushFrame(frames[i]);
       if (extractor.finished && !dispatched) {
         dispatched = true;
         dispatch(extractor.text, true);
@@ -129,10 +171,7 @@ function claudeHookInstaller() {
           var tail = decoder.decode();
           if (tail) feed(tail);
           var rest = frameDecoder.finish();
-          for (var i = 0; i < rest.length; i++) {
-            var parsed = parseBlock(rest[i]);
-            if (parsed) extractor.consume(parsed);
-          }
+          for (var i = 0; i < rest.length; i++) flushFrame(rest[i]);
           if (!dispatched) { dispatched = true; dispatch(extractor.text, true); }
           return;
         }
@@ -164,7 +203,7 @@ function claudeHookInstaller() {
     };
   }
 
-  // ---------- XHR 拦截（被动读取 responseText）----------
+  // ---------- XHR 拦截 ----------
   var origOpen = XMLHttpRequest.prototype.open;
   var origSend = XMLHttpRequest.prototype.send;
   var xhrInfo = new WeakMap();
@@ -186,6 +225,15 @@ function claudeHookInstaller() {
     var extractor = createExtractor();
     var dispatched = false;
 
+    function flushFrame(frame) {
+      var r = parseBlock(frame);
+      if (r.done) { extractor.markDone(); return; }
+      if (r.data == null) return;
+      var parsed;
+      try { parsed = JSON.parse(r.data); } catch (e) { return; }
+      extractor.consume(parsed);
+    }
+
     function consumeChunk() {
       var raw;
       try { raw = xhr.responseText; } catch (e) { return; }
@@ -193,10 +241,7 @@ function claudeHookInstaller() {
       var chunk = raw.slice(lastLen);
       lastLen = raw.length;
       var frames = frameDecoder.push(chunk);
-      for (var i = 0; i < frames.length; i++) {
-        var parsed = parseBlock(frames[i]);
-        if (parsed) extractor.consume(parsed);
-      }
+      for (var i = 0; i < frames.length; i++) flushFrame(frames[i]);
       if (extractor.finished && !dispatched) {
         dispatched = true;
         dispatch(extractor.text, true);
@@ -207,10 +252,7 @@ function claudeHookInstaller() {
       if (xhr.readyState === 3 || xhr.readyState === 4) consumeChunk();
       if (xhr.readyState === 4 && !dispatched) {
         var rest = frameDecoder.finish();
-        for (var i = 0; i < rest.length; i++) {
-          var parsed = parseBlock(rest[i]);
-          if (parsed) extractor.consume(parsed);
-        }
+        for (var i = 0; i < rest.length; i++) flushFrame(rest[i]);
         dispatched = true;
         dispatch(extractor.text, true);
       }
@@ -219,12 +261,12 @@ function claudeHookInstaller() {
 }
 
 module.exports = {
-  id: 'claude',
-  name: 'Claude',
+  id: 'chatgpt',
+  name: 'ChatGPT',
   // 使用网络请求拦截方式获取 AI 回复（替代 DOM 抓取）
   useIntercept: true,
-  homeUrl: 'https://claude.ai/new',
-  sessionUrlBase: 'https://claude.ai/chat/',
+  homeUrl: 'https://chatgpt.com/',
+  sessionUrlBase: 'https://chatgpt.com/c/',
 
   // 判断元素是否可见（offsetWidth/offsetHeight > 0）
   isElementVisible(el) {
@@ -232,10 +274,10 @@ module.exports = {
     return el.offsetWidth > 0 && el.offsetHeight > 0;
   },
 
-  // 查找可见的聊天输入框（Claude 用 ProseMirror contenteditable）
+  // 查找可见的聊天输入框（ChatGPT 用 ProseMirror contenteditable）
   findInput() {
     const selectors = [
-      'div[role="textbox"].tiptap',
+      'div[contenteditable="true"].ProseMirror',
       'div[role="textbox"]',
       'div.ProseMirror',
       'div[contenteditable="true"]',
@@ -253,9 +295,9 @@ module.exports = {
   // 查找可见且未禁用的发送按钮
   findSendButton() {
     const selectors = [
-      'button[aria-label="Send message"]',
-      '[data-testid="chat-input-send"]',
-      'button[aria-label*="send"]',
+      'button[data-testid="send-button"]',
+      'button[aria-label="发送提示词"]',
+      'button[aria-label*="发送"]',
       'button[aria-label*="Send"]',
     ];
     for (const sel of selectors) {
@@ -267,30 +309,68 @@ module.exports = {
     return null;
   },
 
-  // 提取当前用户信息文本（左下角账号名）
+  // 提取当前用户信息文本
+  // 优先从 localStorage 的 accountSwitchSessions 读取（稳定，不受 DOM 渲染影响）；
+  // 失败再回退到侧边栏 DOM 提取。
   extractUserInfo() {
-    const el = document.querySelector('.df-user-menu-btn span.whitespace-nowrap.text-secondary');
-    return el ? el.textContent.trim() : '';
+    // 1. localStorage: oai/apps/accountSwitchSessions -> [0].name
+    try {
+      const raw = localStorage.getItem('oai/apps/accountSwitchSessions');
+      if (raw) {
+        const sessions = JSON.parse(raw);
+        if (Array.isArray(sessions) && sessions.length > 0 && sessions[0].name) {
+          return String(sessions[0].name).trim();
+        }
+      }
+    } catch (_) {}
+
+    // 2. 优先用常见按钮选择器
+    const btn = document.querySelector('[data-testid="profile-button"]') ||
+      document.querySelector('button[aria-label*="profile" i]') ||
+      document.querySelector('button[aria-label*="account" i]');
+    if (btn) {
+      const aria = btn.getAttribute('aria-label') || '';
+      if (aria) return aria.trim();
+    }
+
+    // 3. 侧边栏底部用户区：class 含 z-30 的底部固定容器
+    const containers = document.querySelectorAll('nav div[class*="z-30"]');
+    for (const el of containers) {
+      const clone = el.cloneNode(true);
+      clone.querySelectorAll('button').forEach(b => b.remove());
+      const text = (clone.textContent || '').trim();
+      if (text && text !== 'ChatGPT' && text.length <= 40) {
+        return text;
+      }
+    }
+    return '';
   },
 
-  // 首页判断正则（https://claude.ai/new 或 https://claude.ai/）
-  homeUrlPattern: /^https:\/\/claude\.ai(\/new)?\/?(\?.*)?$/,
+  // 首页判断正则（https://chatgpt.com/ 或 https://chatgpt.com）
+  homeUrlPattern: /^https:\/\/chatgpt\.com\/?$/,
 
-  // 从 URL 提取会话 ID（Claude 是 /chat/xxx 格式）
+  // 从 URL 提取会话 ID（ChatGPT 是 /c/xxx 格式）
+  // 从 URL 提取会话 ID（ChatGPT 是 /c/{uuid} 格式）
+  // 注意：创建会话过程中 URL 有中间态 /c/WEB:xxx，不能把 WEB 当会话 ID。
+  // session-store 会优先使用本方法的返回值，故此处必须自行排除 WEB。
   extractSessionId(url) {
     if (!url) return null;
-    const match = url.match(/\/chat\/([a-zA-Z0-9_-]+)/i);
-    if (match) return match[1];
+    // 优先匹配完整 UUID（正式会话 ID）
+    const uuidMatch = url.match(/\/c\/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/i);
+    if (uuidMatch) return uuidMatch[1];
+    // 回退通用匹配，排除中间态 WEB
+    const genericMatch = url.match(/\/c\/([a-zA-Z0-9_-]+)/i);
+    if (genericMatch && genericMatch[1] !== 'WEB') return genericMatch[1];
     return null;
   },
 
   // 判断 URL 是否属于本平台
   matchesUrl(url) {
-    return url.includes('claude.ai');
+    return url.includes('chatgpt.com') || url.includes('chat.openai.com');
   },
 
   // 返回注入主世界的网络拦截器源码（拦截模式使用）
   getHookSource() {
-    return '(' + claudeHookInstaller.toString() + ')();';
+    return '(' + chatgptHookInstaller.toString() + ')();';
   },
 };
