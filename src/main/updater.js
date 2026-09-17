@@ -91,6 +91,109 @@ function isGitHubAccessError(error) {
   return githubKeywords.some((kw) => msg.includes(kw));
 }
 
+/**
+ * 判断是否为 HTTPS 证书类错误
+ * 代理 / VPN / 杀毒软件的 HTTPS 拦截会替换证书，之前这类错误全部落进"未知错误"。
+ */
+function isCertificateError(error) {
+  const msg = String(error && (error.message || error.stack) || '').toLowerCase();
+  const certKeywords = [
+    'unable to verify the first certificate',
+    'unable to get local issuer certificate',
+    'unable_to_verify_leaf_signature',
+    'self signed certificate',
+    'self-signed certificate',
+    'certificate has expired',
+    'certificate is not yet valid',
+    'err_cert',
+    'err_ssl',
+    'cert_',
+    'schannel',
+  ];
+  return certKeywords.some((kw) => msg.includes(kw));
+}
+
+/** 判断是否为更新配置缺失（resources/app-update.yml 未随包分发） */
+function isMissingUpdateConfigError(error) {
+  const msg = String(error && (error.message || error.stack) || '').toLowerCase();
+  return msg.includes('app-update.yml') && (msg.includes('enoent') || msg.includes('no such file'));
+}
+
+/** 从各种形态的 error 中取出可读文本（字符串 / Error / 无 message 的对象） */
+function errorText(error) {
+  if (!error) return '';
+  if (typeof error === 'string') return error;
+  if (error.message) return String(error.message);
+  if (error.stack) return String(error.stack);
+  return '';
+}
+
+/**
+ * 归类更新错误，给出用户可读的标题、一句话提示与详情
+ * @param {Error|string|null} error
+ * @returns {{ kind: 'config'|'cert'|'network'|'github'|'unknown', message: string, hint: string, detail: string }}
+ */
+function classifyUpdateError(error) {
+  const raw = errorText(error).slice(0, 300);
+
+  if (isMissingUpdateConfigError(error)) {
+    return {
+      kind: 'config',
+      message: '更新配置缺失',
+      hint: '安装包缺少 app-update.yml（打包缺陷，非网络问题），请更新到修复版本',
+      detail: '安装包内缺少 resources/app-update.yml，无法检查更新。这是打包缺陷，不是网络问题，请更新到修复版本。\n\n错误信息：' + raw,
+    };
+  }
+  if (isCertificateError(error)) {
+    return {
+      kind: 'cert',
+      message: 'HTTPS 证书校验失败',
+      hint: '无法验证 GitHub 的 HTTPS 证书，请关闭代理 / VPN / 杀软 HTTPS 拦截后重试',
+      detail: '无法验证 GitHub 的 HTTPS 证书，常见于代理、VPN 或杀毒软件的 HTTPS 拦截。请关闭后重试。\n\n错误信息：' + raw,
+    };
+  }
+  if (isNetworkError(error)) {
+    return {
+      kind: 'network',
+      message: '无法连接到更新服务器',
+      hint: '无法连接 GitHub，请检查网络或代理',
+      detail: '请检查网络连接。更新服务器位于 GitHub，可能需要代理或 VPN 才能访问。\n\n错误信息：' + raw,
+    };
+  }
+  if (isGitHubAccessError(error)) {
+    return {
+      kind: 'github',
+      message: '无法访问 GitHub 更新服务器',
+      hint: 'GitHub 访问受限，请检查网络或代理',
+      detail: 'GitHub 访问受限或更新资源不存在。请确认仓库名称和发布版本正确。\n\n错误信息：' + raw,
+    };
+  }
+  return {
+    kind: 'unknown',
+    message: '检查更新失败',
+    hint: '未预期错误：' + (raw || '（无错误信息）'),
+    detail: '发生未预期错误。\n\n错误信息：' + (raw || '（无错误信息）'),
+  };
+}
+
+// ========== 更新日志（打包版原本不落任何日志，更新失败无法排查）==========
+const LOG_MAX_BYTES = 256 * 1024;
+
+/** 追加一行更新日志到 <userData>/logs/updater.log，超过上限则重写 */
+function logUpdaterEvent(line) {
+  try {
+    const dir = path.join(app.getPath('userData'), 'logs');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'updater.log');
+    try {
+      if (fs.statSync(file).size > LOG_MAX_BYTES) fs.writeFileSync(file, '', 'utf-8');
+    } catch (_) { /* 首次写入时文件不存在 */ }
+    fs.appendFileSync(file, '[' + new Date().toISOString() + '] ' + line + '\n', 'utf-8');
+  } catch (err) {
+    console.warn('[Updater] 写入更新日志失败:', err.message);
+  }
+}
+
 /** 显示系统通知（不打断用户） */
 function showNotification(title, body) {
   if (Notification.isSupported()) {
@@ -100,26 +203,13 @@ function showNotification(title, body) {
 
 /** 弹出更新失败对话框，提供重试/取消选项 */
 async function showUpdateErrorDialog(error, isManual) {
+  const { kind, message, hint, detail } = classifyUpdateError(error);
+  logUpdaterEvent((isManual ? 'manual' : 'auto') + ' check failed [' + kind + '] ' + errorText(error));
+
   // 自动检查失败时，静默提示即可，不弹对话框打扰用户
   if (!isManual) {
-    const detail = isNetworkError(error) || isGitHubAccessError(error)
-      ? '无法连接到更新服务器（GitHub），请检查网络连接。'
-      : '发生未知错误，请稍后重试。';
-    showNotification('检查更新失败', detail);
+    showNotification('检查更新失败', hint);
     return false; // 自动检查失败不弹对话框
-  }
-
-  // 手动检查失败时，弹出对话框并给出详细原因
-  let message = '检查更新失败';
-  let detail = '';
-  if (isNetworkError(error)) {
-    message = '无法连接到更新服务器';
-    detail = '请检查网络连接。更新服务器位于 GitHub，可能需要代理或 VPN 才能访问。\n\n错误信息：' + (error.message || '');
-  } else if (isGitHubAccessError(error)) {
-    message = '无法访问 GitHub 更新服务器';
-    detail = 'GitHub 访问受限或更新资源不存在。请确认仓库名称和发布版本正确。\n\n错误信息：' + (error.message || '');
-  } else {
-    detail = '发生未知错误。\n\n错误信息：' + (error.message || '');
   }
 
   const options = {
@@ -184,6 +274,7 @@ autoUpdater.on('checking-for-update', () => {
 
 autoUpdater.on('update-available', async (info) => {
   console.log('[Updater] 发现新版本:', info.version);
+  logUpdaterEvent('update available: v' + info.version);
 
   // 便携版：zip 无法自动安装，提示用户去下载页手动覆盖升级
   if (IS_PORTABLE) {
@@ -236,6 +327,7 @@ autoUpdater.on('update-available', async (info) => {
 
 autoUpdater.on('update-not-available', () => {
   console.log('[Updater] 已是最新版本');
+  logUpdaterEvent('update not available (current v' + app.getVersion() + ')');
   if (isManualCheck) {
     showNotification('已是最新版本', '当前已是最新版本。');
   }
@@ -321,4 +413,7 @@ module.exports = {
   setMainWindow,
   isNetworkError,
   isGitHubAccessError,
+  isCertificateError,
+  isMissingUpdateConfigError,
+  classifyUpdateError,
 };
