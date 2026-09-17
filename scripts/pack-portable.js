@@ -41,6 +41,32 @@ function rmrf(p) {
   fs.rmSync(p, { recursive: true, force: true });
 }
 
+/**
+ * 生成 electron-updater 运行所需的 resources/app-update.yml
+ *
+ * 背景：electron-builder 只在 nsis 等"可自动更新"的 Windows target 下写这个文件
+ * （app-builder-lib/out/publish/PublishManager.js：目标不合适即 return），
+ * `--dir` 构建会漏掉它 ⇒ 应用内 checkForUpdates() 抛 ENOENT: app-update.yml，
+ * 被 updater 归为"未知错误"，每次启动弹"检查更新失败"。此处按 electron-builder
+ * 的同样格式补齐。
+ */
+function writeAppUpdateYml(resourcesDir) {
+  const pub = Array.isArray(pkg.build && pkg.build.publish) ? pkg.build.publish[0] : (pkg.build && pkg.build.publish);
+  if (!pub || !pub.provider) {
+    console.warn('[pack-portable] 警告: package.json 缺少 build.publish，跳过 app-update.yml（应用内更新检查将不可用）');
+    return false;
+  }
+  const yamlValue = (v) => (/^[A-Za-z0-9._/@-]+$/.test(String(v)) ? String(v) : JSON.stringify(String(v)));
+  const lines = ['provider: ' + yamlValue(pub.provider)];
+  for (const key of ['owner', 'repo', 'url', 'channel']) {
+    if (pub[key]) lines.push(key + ': ' + yamlValue(pub[key]));
+  }
+  // 与 electron-builder 的 AppInfo.updaterCacheDirName 保持一致：sanitizedName.toLowerCase() + '-updater'
+  lines.push('updaterCacheDirName: ' + String(pkg.name).toLowerCase() + '-updater');
+  fs.writeFileSync(path.join(resourcesDir, 'app-update.yml'), lines.join('\n') + '\n', 'utf-8');
+  return true;
+}
+
 // 1. 构建未打包目录
 console.log('[pack-portable] 1/4 electron-builder --win --dir ...');
 run('npx', ['electron-builder', '--win', '--dir', '--publish', 'never']);
@@ -49,10 +75,11 @@ if (!fs.existsSync(path.join(unpackedDir, 'Cuckoo-Code.exe'))) {
 }
 
 // 2. 注入便携文件
-console.log('[pack-portable] 2/4 注入 portable.flag / data/ / 使用说明.md ...');
+console.log('[pack-portable] 2/4 注入 portable.flag / data/ / 使用说明.md / app-update.yml ...');
 fs.writeFileSync(path.join(unpackedDir, 'portable.flag'), '', 'utf-8');
 fs.mkdirSync(path.join(unpackedDir, 'data'), { recursive: true });
 fs.writeFileSync(path.join(unpackedDir, 'data', '.gitkeep'), '', 'utf-8');
+writeAppUpdateYml(path.join(unpackedDir, 'resources'));
 const readme = [
   '# Cuckoo Code 便携版 使用说明',
   '',
@@ -106,6 +133,8 @@ const mustHave = [
   APP_FOLDER_NAME + '/portable.flag',
   APP_FOLDER_NAME + '/data/',
   APP_FOLDER_NAME + '/使用说明.md',
+  // 回归防线：缺它会让应用内检查更新每次都报"未知错误"
+  APP_FOLDER_NAME + '/resources/app-update.yml',
 ];
 const missing = mustHave.filter((n) => !names.includes(n));
 if (missing.length > 0) fail('zip 缺少必需条目: ' + missing.join(', '));
