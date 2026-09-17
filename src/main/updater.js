@@ -3,8 +3,14 @@
  * 使用 electron-updater + generic provider（GitHub Releases）检查并下载更新。
  * 职责：检查更新、下载进度提示、下载完成提醒、网络错误友好提示。
  */
-const { app, dialog, Notification } = require('electron');
+const { app, dialog, Notification, shell } = require('electron');
+const fs = require('fs');
+const path = require('path');
 const { autoUpdater } = require('electron-updater');
+
+// 便携模式：由 src/main/index.js 在数据目录解析后写入环境变量。
+// zip 便携版无法自动安装更新（Windows 自动更新仅支持 NSIS），只提示并跳转下载页。
+const IS_PORTABLE = process.env.CUCKOO_PORTABLE === '1';
 
 // ========== 日志配置 ==========
 // 打包版禁用文件日志持久化：不加载 electron-log，也不写文件
@@ -16,7 +22,21 @@ if (app.isPackaged) {
   autoUpdater.logger.transports.file.level = 'info';
 }
 autoUpdater.autoDownload = false; // 检测到更新后不自动下载，等用户确认
-autoUpdater.autoInstallOnAppQuit = true; // 退出时自动安装（支持 NSIS）
+autoUpdater.autoInstallOnAppQuit = !IS_PORTABLE; // 退出时自动安装（仅 NSIS 安装版支持）
+
+/** 便携版跳转用的 Releases 页地址（读取 package.json 的 publish 配置，兼容数组/对象两种写法） */
+function getReleasesUrl() {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(app.getAppPath(), 'package.json'), 'utf-8'));
+    const pub = pkg.build && (Array.isArray(pkg.build.publish) ? pkg.build.publish[0] : pkg.build.publish);
+    if (pub && pub.owner && pub.repo) {
+      return 'https://github.com/' + pub.owner + '/' + pub.repo + '/releases/latest';
+    }
+  } catch (err) {
+    console.warn('[Updater] 读取 publish 配置失败:', err.message);
+  }
+  return 'https://github.com/wangyongpeng90/cuckoo-code/releases/latest';
+}
 
 // ========== 状态标志 ==========
 let updateChecked = false;       // 是否已执行过检查
@@ -164,6 +184,33 @@ autoUpdater.on('checking-for-update', () => {
 
 autoUpdater.on('update-available', async (info) => {
   console.log('[Updater] 发现新版本:', info.version);
+
+  // 便携版：zip 无法自动安装，提示用户去下载页手动覆盖升级
+  if (IS_PORTABLE) {
+    isManualCheck = false;
+    const portableOptions = {
+      type: 'info',
+      title: '发现新版本',
+      message: '发现新版本 v' + info.version,
+      detail: '便携版不支持自动安装更新。\n\n升级方法：下载新版便携 zip，覆盖解压到当前目录即可（data 数据文件夹会保留）。',
+      buttons: ['打开下载页', '暂不'],
+      defaultId: 0,
+      cancelId: 1,
+    };
+    const portableParent = mainWindowRef && !mainWindowRef.isDestroyed() ? mainWindowRef : null;
+    const portableResult = portableParent
+      ? await dialog.showMessageBox(portableParent, portableOptions)
+      : await dialog.showMessageBox(portableOptions);
+    if (portableResult.response === 0) {
+      const url = getReleasesUrl();
+      console.log('[Updater] 打开下载页:', url);
+      if (shell && typeof shell.openExternal === 'function') {
+        shell.openExternal(url);
+      }
+    }
+    return;
+  }
+
   const options = {
     type: 'info',
     title: '发现新版本',
